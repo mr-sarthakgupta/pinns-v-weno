@@ -1,0 +1,5 @@
+Inference Times:
+==============================
+PINN Inference Time: 0.414727 seconds
+WENO Inference Time: 0.541742 seconds
+==============================

@@ -16,8 +16,8 @@ torch.manual_seed(1234)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
-# Create directory for saving results
-os.makedirs('results', exist_ok=True)
+# Create directory for saving results_ns
+os.makedirs('results_ns_ns', exist_ok=True)
 
 # =============================================
 # Define the exact solution for 2D lid-driven cavity flow
@@ -82,8 +82,8 @@ class PINN(nn.Module):
         for _ in range(num_hidden_layers):
             self.hidden_layers.append(nn.Linear(num_neurons, num_neurons))
         
-        # Output layer (u, v, p)
-        self.output_layer = nn.Linear(num_neurons, 3)
+        # Output layer for stream function (ψ)
+        self.output_layer = nn.Linear(num_neurons, 1)
         
         # Activation function
         self.activation = nn.Tanh()
@@ -96,13 +96,14 @@ class PINN(nn.Module):
             x: Input tensor of shape [batch_size, 2] containing coordinates (x, y)
             
         Returns:
-            Output tensor of shape [batch_size, 3] containing (u, v, p)
+            Output tensor of shape [batch_size, 1] containing stream function (ψ)
         """
         x = self.activation(self.input_layer(x))
         
         for layer in self.hidden_layers:
             x = self.activation(layer(x))
         
+        # Output is the stream function ψ
         return self.output_layer(x)
     
     def net_uvp(self, x, y):
@@ -115,12 +116,35 @@ class PINN(nn.Module):
         Returns:
             u, v, p: Velocity and pressure predictions
         """
-        coords = torch.cat([x, y], dim=1)
-        output = self.forward(coords)
+        x.requires_grad_(True)
+        y.requires_grad_(True)
         
-        u = output[:, 0:1]
-        v = output[:, 1:2]
-        p = output[:, 2:3]
+        coords = torch.cat([x, y], dim=1)
+        
+        # Compute stream function ψ
+        psi = self.forward(coords)
+        
+        # Compute u and v from stream function derivatives
+        # u = ∂ψ/∂y, v = -∂ψ/∂x
+        u = grad(psi.sum(), y, create_graph=True)[0]
+        v = -grad(psi.sum(), x, create_graph=True)[0]
+        
+        # For pressure, we'll predict it directly through a separate network
+        # This is implemented as a separate forward pass with additional output neurons
+        # For simplicity, we'll compute pressure through appropriate derivatives
+        u_x = grad(u.sum(), x, create_graph=True)[0]
+        u_y = grad(u.sum(), y, create_graph=True)[0]
+        v_x = grad(v.sum(), x, create_graph=True)[0]
+        v_y = grad(v.sum(), y, create_graph=True)[0]
+        
+        # Laplacian of stream function (∇²ψ) relates to vorticity (ω = v_x - u_y)
+        # We use the Poisson equation for pressure: ∇²p = -ρ(∂u_i/∂x_j)(∂u_j/∂x_i)
+        # For incompressible flow: ∇²p = -ρ(u_x²+2u_y·v_x+v_y²)
+        p_field = -(u_x**2 + 2*u_y*v_x + v_y**2)
+        
+        # Integrate to get pressure (ignoring constant of integration)
+        # This is a simplified approach - in reality, we might need to solve another system
+        p = torch.cumsum(p_field, dim=0) / p_field.shape[0]
         
         return u, v, p
 
@@ -134,12 +158,12 @@ def compute_pinn_residuals(model, x, y, Re=100):
         Re: Reynolds number
         
     Returns:
-        continuity, momentum_x, momentum_y: Residuals for each equation
+        momentum_x, momentum_y: Residuals for momentum equations
     """
     x.requires_grad_(True)
     y.requires_grad_(True)
     
-    # Get predictions
+    # Get predictions using stream function formulation
     u, v, p = model.net_uvp(x, y)
     
     # Compute derivatives
@@ -156,9 +180,9 @@ def compute_pinn_residuals(model, x, y, Re=100):
     v_xx = grad(v_x.sum(), x, create_graph=True)[0]
     v_yy = grad(v_y.sum(), y, create_graph=True)[0]
     
-    # Continuity equation: ∇·u = 0
+    # The continuity equation is automatically satisfied due to the stream function formulation
     continuity = u_x + v_y
-    
+
     # Momentum equation x: u·∇u = -∇p + (1/Re)·∇²u
     momentum_x = (u * u_x + v * u_y) + p_x - (1/Re) * (u_xx + u_yy)
     
@@ -187,7 +211,7 @@ def train_pinn(domain_points=10000, boundary_points=1000, Re=100, num_epochs=200
     # Create model and move to device
     model = PINN(num_hidden_layers=8, num_neurons=50).to(device)
     
-    # Initialize optimizer
+    # Initialize Adam optimizer
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5000, gamma=0.5)
     
@@ -215,7 +239,7 @@ def train_pinn(domain_points=10000, boundary_points=1000, Re=100, num_epochs=200
     # Lists to store loss history
     loss_history = {'total': [], 'pde': [], 'bc': []}
     
-    # Training loop
+    # Adam Training loop
     start_time = time.time()
     for epoch in range(num_epochs + 1):
         optimizer.zero_grad()
@@ -223,25 +247,25 @@ def train_pinn(domain_points=10000, boundary_points=1000, Re=100, num_epochs=200
         # PDE residuals
         continuity, momentum_x, momentum_y = compute_pinn_residuals(model, x_domain, y_domain, Re)
         
-        pde_loss = torch.mean(continuity**2) + torch.mean(momentum_x**2) + torch.mean(momentum_y**2)
+        pde_loss = torch.mean(momentum_x**2) + torch.mean(momentum_y**2) + torch.mean(continuity**2)
         
-        # Boundary conditions
-        # Bottom wall: u=v=0
-        u_bottom, v_bottom, _ = model.net_uvp(x_bottom, y_bottom)
+        # Boundary conditions for stream function formulation
+        # Bottom wall: u=v=0 (ψ=const, we set ψ=0)
+        _, _, psi_bottom = model.net_uvp(x_bottom, y_bottom)
         
-        # Top wall: u=1, v=0 (lid)
+        # Top wall: u=1, v=0 (ψ = y at y=1)
         u_top, v_top, _ = model.net_uvp(x_top, y_top)
         
-        # Left wall: u=v=0
-        u_left, v_left, _ = model.net_uvp(x_left, y_left)
+        # Left wall: u=v=0 (ψ=const, we set ψ=0)
+        _, _, psi_left = model.net_uvp(x_left, y_left)
         
-        # Right wall: u=v=0
-        u_right, v_right, _ = model.net_uvp(x_right, y_right)
+        # Right wall: u=v=0 (ψ=const, we set ψ=0)
+        _, _, psi_right = model.net_uvp(x_right, y_right)
         
-        bc_loss = (torch.mean(u_bottom**2) + torch.mean(v_bottom**2) + 
+        bc_loss = (torch.mean(psi_bottom**2) + 
                    torch.mean((u_top - 1.0)**2) + torch.mean(v_top**2) + 
-                   torch.mean(u_left**2) + torch.mean(v_left**2) + 
-                   torch.mean(u_right**2) + torch.mean(v_right**2))
+                   torch.mean(psi_left**2) + 
+                   torch.mean(psi_right**2))
         
         # Total loss
         loss = pde_loss + 10.0 * bc_loss
@@ -262,6 +286,49 @@ def train_pinn(domain_points=10000, boundary_points=1000, Re=100, num_epochs=200
             print(f"Epoch {epoch}/{num_epochs}, Loss: {loss.item():.6f}, PDE Loss: {pde_loss.item():.6f}, BC Loss: {bc_loss.item():.6f}, Time: {elapsed:.2f}s")
             start_time = time.time()
     
+    # L-BFGS optimization after Adam
+    print("Starting L-BFGS optimization...")
+    
+    # Define closure function for L-BFGS
+    def closure():
+        optimizer_lbfgs.zero_grad()
+        
+        # PDE residuals
+        continuity, momentum_x, momentum_y = compute_pinn_residuals(model, x_domain, y_domain, Re)
+        pde_loss = torch.mean(momentum_x**2) + torch.mean(momentum_y**2) + torch.mean(continuity**2)
+        
+        # Boundary conditions
+        _, _, psi_bottom = model.net_uvp(x_bottom, y_bottom)
+        u_top, v_top, _ = model.net_uvp(x_top, y_top)
+        _, _, psi_left = model.net_uvp(x_left, y_left)
+        _, _, psi_right = model.net_uvp(x_right, y_right)
+        
+        bc_loss = (torch.mean(psi_bottom**2) + 
+                   torch.mean((u_top - 1.0)**2) + torch.mean(v_top**2) + 
+                   torch.mean(psi_left**2) + 
+                   torch.mean(psi_right**2))
+        
+        # Total loss
+        loss = pde_loss + 10.0 * bc_loss
+        
+        loss.backward()
+        
+        return loss
+    
+    # Initialize L-BFGS optimizer
+    optimizer_lbfgs = torch.optim.LBFGS(model.parameters(), 
+                                        max_iter=500, 
+                                        max_eval=500, 
+                                        tolerance_grad=1e-05, 
+                                        tolerance_change=1e-09, 
+                                        history_size=50, 
+                                        line_search_fn="strong_wolfe")
+    
+    # Run L-BFGS optimization
+    optimizer_lbfgs.step(closure)
+    
+    print("L-BFGS optimization completed")
+    
     return model, loss_history
 
 def evaluate_pinn(model, nx=101, ny=101, Re=100):
@@ -276,6 +343,7 @@ def evaluate_pinn(model, nx=101, ny=101, Re=100):
     Returns:
         x_grid, y_grid: Mesh grid coordinates
         u_pred, v_pred, p_pred: Predicted solutions
+        psi_pred: Predicted stream function
     """
     # Create mesh grid
     x = np.linspace(0, 1, nx)
@@ -289,17 +357,24 @@ def evaluate_pinn(model, nx=101, ny=101, Re=100):
     # Evaluate model
     model.eval()
     with torch.no_grad():
+        # First get u, v, p
         u_pred, v_pred, p_pred = model.net_uvp(x_tensor, y_tensor)
+        
+        # Get stream function
+        coords = torch.cat([x_tensor, y_tensor], dim=1)
+        psi_pred = model(coords)
     
     # Convert back to numpy and reshape
     u_pred = u_pred.cpu().numpy().reshape(ny, nx)
     v_pred = v_pred.cpu().numpy().reshape(ny, nx)
     p_pred = p_pred.cpu().numpy().reshape(ny, nx)
+    psi_pred = psi_pred.cpu().numpy().reshape(ny, nx)
     
     # Center the pressure field (it's defined up to a constant)
     p_pred = p_pred - np.mean(p_pred)
     
-    return x_grid, y_grid, u_pred, v_pred, p_pred
+    return x_grid, y_grid, u_pred, v_pred, p_pred, psi_pred
+
 
 # =============================================
 # WENO Scheme Implementation for Navier-Stokes
@@ -351,6 +426,7 @@ class WENOSolver:
         Returns:
             q_minus, q_plus: Reconstructed values at interfaces
         """
+
         # Shift arrays for stencil
         qm2 = np.roll(q, 2, axis=1)
         qm1 = np.roll(q, 1, axis=1)
@@ -655,250 +731,6 @@ class WENOSolver:
         
         return self.u, self.v, self.p, convergence_history
 
-
-# =============================================
-# Main Program for Comparison
-# =============================================
-
-# def main(Re=100, nx=65, ny=65):
-#     """
-#     Main function to run the comparison between PINN and WENO
-    
-#     Args:
-#         Re: Reynolds number
-#         nx, ny: Number of grid points for evaluation
-#     """
-#     print("=" * 50)
-#     print(f"Comparing PINN and WENO for Re = {Re}")
-#     print("=" * 50)
-    
-#     # ======================
-#     # PART 1: PINN Solution
-#     # ======================
-#     print("\n[1/4] Training PINN model...")
-#     model, loss_history = train_pinn(Re=Re, num_epochs=1_00_000)
-    
-#     # Plot loss history
-#     plt.figure(figsize=(10, 6))
-#     plt.semilogy(loss_history['total'], label='Total Loss')
-#     plt.semilogy(loss_history['pde'], label='PDE Loss')
-#     plt.semilogy(loss_history['bc'], label='BC Loss')
-#     plt.xlabel('Epoch')
-#     plt.ylabel('Loss')
-#     plt.title('PINN Training Loss History')
-#     plt.legend()
-#     plt.grid(True)
-#     plt.savefig('results/pinn_loss_history.png', dpi=300, bbox_inches='tight')
-    
-#     print("\n[2/4] Evaluating PINN model...")
-#     x_grid, y_grid, u_pinn, v_pinn, p_pinn = evaluate_pinn(model, nx=nx, ny=ny, Re=Re)
-    
-#     # ======================
-#     # PART 2: WENO Solution
-#     # ======================
-#     print("\n[3/4] Running WENO solver...")
-#     weno_solver = WENOSolver(nx=nx, ny=ny, Re=Re, dt=0.001, max_iter=1_00_000, tol=1e-5)
-#     u_weno, v_weno, p_weno, weno_history = weno_solver.solve()
-    
-#     # Plot convergence history
-#     plt.figure(figsize=(10, 6))
-#     plt.semilogy(weno_history)
-#     plt.xlabel('Iteration')
-#     plt.ylabel('Residual')
-#     plt.title('WENO Solver Convergence History')
-#     plt.grid(True)
-#     plt.savefig('results/weno_convergence_history.png', dpi=300, bbox_inches='tight')
-    
-#     # ======================
-#     # PART 3: Exact Solution
-#     # ======================
-#     print("\n[4/4] Computing exact solution...")
-#     u_exact, v_exact, p_exact = exact_solution(x_grid, y_grid, Re=Re)
-    
-#     # ======================
-#     # PART 4: Error Analysis and Visualization
-#     # ======================
-#     print("\nGenerating comparative visualizations...")
-    
-#     # Compute errors
-#     u_error_pinn = np.abs(u_pinn - u_exact)
-#     v_error_pinn = np.abs(v_pinn - v_exact)
-#     p_error_pinn = np.abs(p_pinn - p_exact)
-    
-#     u_error_weno = np.abs(u_weno - u_exact)
-#     v_error_weno = np.abs(v_weno - v_exact)
-#     p_error_weno = np.abs(p_weno - p_exact)
-    
-#     # Relative L2 errors
-#     u_rel_l2_pinn = np.sqrt(np.sum(u_error_pinn**2)) / np.sqrt(np.sum(u_exact**2))
-#     v_rel_l2_pinn = np.sqrt(np.sum(v_error_pinn**2)) / np.sqrt(np.sum(v_exact**2))
-#     p_rel_l2_pinn = np.sqrt(np.sum(p_error_pinn**2)) / np.sqrt(np.sum(p_exact**2))
-    
-#     u_rel_l2_weno = np.sqrt(np.sum(u_error_weno**2)) / np.sqrt(np.sum(u_exact**2))
-#     v_rel_l2_weno = np.sqrt(np.sum(v_error_weno**2)) / np.sqrt(np.sum(v_exact**2))
-#     p_rel_l2_weno = np.sqrt(np.sum(p_error_weno**2)) / np.sqrt(np.sum(p_exact**2))
-    
-#     # Print error summary
-#     print("\nError Summary:")
-#     print(f"PINN Relative L2 Errors: u = {u_rel_l2_pinn:.6f}, v = {v_rel_l2_pinn:.6f}, p = {p_rel_l2_pinn:.6f}")
-#     print(f"WENO Relative L2 Errors: u = {u_rel_l2_weno:.6f}, v = {v_rel_l2_weno:.6f}, p = {p_rel_l2_weno:.6f}")
-    
-# # Plot velocity magnitude
-#     def plot_velocity_magnitude(u, v, x_grid, y_grid, title, filename):
-#         """Plot velocity magnitude as a contour plot"""
-#         vel_mag = np.sqrt(u**2 + v**2)
-        
-#         plt.figure(figsize=(10, 8))
-#         contour = plt.contourf(x_grid, y_grid, vel_mag, 50, cmap='viridis')
-#         plt.colorbar(contour, label='Velocity Magnitude')
-#         print(x_grid.T.shape, y_grid.T.shape)
-#         plt.streamplot(x_grid.T, y_grid.T, u.T, v.T, color='white', density=1.5, linewidth=0.5)
-#         plt.xlabel('x')
-#         plt.ylabel('y')
-#         plt.title(title)
-#         plt.savefig(filename, dpi=300, bbox_inches='tight')
-    
-#     # Plot all three solutions (exact, PINN, WENO)
-#     # plot_velocity_magnitude(u_exact, v_exact, x_grid, y_grid, 
-#     #                        'Exact Solution: Velocity Magnitude',
-#     #                        'results/exact_velocity.png')
-    
-#     # plot_velocity_magnitude(u_pinn, v_pinn, x_grid, y_grid, 
-#     #                        'PINN Solution: Velocity Magnitude',
-#     #                        'results/pinn_velocity.png')
-    
-#     # plot_velocity_magnitude(u_weno, v_weno, x_grid, y_grid, 
-#     #                        'WENO Solution: Velocity Magnitude',
-#     #                        'results/weno_velocity.png')
-    
-#     # Plot error comparison
-#     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-    
-#     # PINN errors
-#     cax1 = axes[0, 0].contourf(x_grid, y_grid, u_error_pinn, 50, cmap='hot')
-#     plt.colorbar(cax1, ax=axes[0, 0], label='Error')
-#     axes[0, 0].set_title('PINN u-velocity Error')
-    
-#     cax2 = axes[0, 1].contourf(x_grid, y_grid, v_error_pinn, 50, cmap='hot')
-#     plt.colorbar(cax2, ax=axes[0, 1], label='Error')
-#     axes[0, 1].set_title('PINN v-velocity Error')
-    
-#     cax3 = axes[0, 2].contourf(x_grid, y_grid, p_error_pinn, 50, cmap='hot')
-#     plt.colorbar(cax3, ax=axes[0, 2], label='Error')
-#     axes[0, 2].set_title('PINN Pressure Error')
-    
-#     # WENO errors
-#     cax4 = axes[1, 0].contourf(x_grid, y_grid, u_error_weno, 50, cmap='hot')
-#     plt.colorbar(cax4, ax=axes[1, 0], label='Error')
-#     axes[1, 0].set_title('WENO u-velocity Error')
-    
-#     cax5 = axes[1, 1].contourf(x_grid, y_grid, v_error_weno, 50, cmap='hot')
-#     plt.colorbar(cax5, ax=axes[1, 1], label='Error')
-#     axes[1, 1].set_title('WENO v-velocity Error')
-    
-#     cax6 = axes[1, 2].contourf(x_grid, y_grid, p_error_weno, 50, cmap='hot')
-#     plt.colorbar(cax6, ax=axes[1, 2], label='Error')
-#     axes[1, 2].set_title('WENO Pressure Error')
-    
-#     plt.tight_layout()
-#     plt.savefig('results/error_comparison.png', dpi=300, bbox_inches='tight')
-    
-#     # Compare center line profiles
-#     center_x = nx // 2
-#     center_y = ny // 2
-    
-#     # Vertical centerline (x = 0.5)
-#     plt.figure(figsize=(10, 8))
-#     plt.plot(y_grid[:, center_x], u_exact[:, center_x], 'k-', linewidth=2, label='Exact')
-#     plt.plot(y_grid[:, center_x], u_pinn[:, center_x], 'r--', linewidth=2, label='PINN')
-#     plt.plot(y_grid[:, center_x], u_weno[:, center_x], 'b-.', linewidth=2, label='WENO')
-#     plt.xlabel('y')
-#     plt.ylabel('u-velocity')
-#     plt.title('Centerline u-velocity Profile (x = 0.5)')
-#     plt.legend()
-#     plt.grid(True)
-#     plt.savefig('results/centerline_u_comparison.png', dpi=300, bbox_inches='tight')
-    
-#     # Horizontal centerline (y = 0.5)
-#     plt.figure(figsize=(10, 8))
-#     plt.plot(x_grid[center_y, :], v_exact[center_y, :], 'k-', linewidth=2, label='Exact')
-#     plt.plot(x_grid[center_y, :], v_pinn[center_y, :], 'r--', linewidth=2, label='PINN')
-#     plt.plot(x_grid[center_y, :], v_weno[center_y, :], 'b-.', linewidth=2, label='WENO')
-#     plt.xlabel('x')
-#     plt.ylabel('v-velocity')
-#     plt.title('Centerline v-velocity Profile (y = 0.5)')
-#     plt.legend()
-#     plt.grid(True)
-#     plt.savefig('results/centerline_v_comparison.png', dpi=300, bbox_inches='tight')
-    
-#     # 3D visualization of solutions
-#     fig = plt.figure(figsize=(18, 6))
-    
-#     # Exact solution
-#     ax1 = fig.add_subplot(131, projection='3d')
-#     surf1 = ax1.plot_surface(x_grid, y_grid, u_exact, cmap=cm.viridis, linewidth=0, antialiased=False)
-#     ax1.set_title('Exact u-velocity')
-#     ax1.set_xlabel('x')
-#     ax1.set_ylabel('y')
-#     ax1.set_zlabel('u')
-#     fig.colorbar(surf1, ax=ax1, shrink=0.5, aspect=5)
-    
-#     # PINN solution
-#     ax2 = fig.add_subplot(132, projection='3d')
-#     surf2 = ax2.plot_surface(x_grid, y_grid, u_pinn, cmap=cm.viridis, linewidth=0, antialiased=False)
-#     ax2.set_title('PINN u-velocity')
-#     ax2.set_xlabel('x')
-#     ax2.set_ylabel('y')
-#     ax2.set_zlabel('u')
-#     fig.colorbar(surf2, ax=ax2, shrink=0.5, aspect=5)
-    
-#     # WENO solution
-#     ax3 = fig.add_subplot(133, projection='3d')
-#     surf3 = ax3.plot_surface(x_grid, y_grid, u_weno, cmap=cm.viridis, linewidth=0, antialiased=False)
-#     ax3.set_title('WENO u-velocity')
-#     ax3.set_xlabel('x')
-#     ax3.set_ylabel('y')
-#     ax3.set_zlabel('u')
-#     fig.colorbar(surf3, ax=ax3, shrink=0.5, aspect=5)
-    
-#     plt.tight_layout()
-#     plt.savefig('results/3d_u_comparison.png', dpi=300, bbox_inches='tight')
-    
-#     # Compute and print performance metrics
-#     print("\nPerformance Comparison:")
-#     print("=" * 50)
-#     print(f"{'Method':<10} {'u-velocity L2':<15} {'v-velocity L2':<15} {'Pressure L2':<15}")
-#     print("-" * 50)
-#     print(f"{'PINN':<10} {u_rel_l2_pinn:<15.6f} {v_rel_l2_pinn:<15.6f} {p_rel_l2_pinn:<15.6f}")
-#     print(f"{'WENO':<10} {u_rel_l2_weno:<15.6f} {v_rel_l2_weno:<15.6f} {p_rel_l2_weno:<15.6f}")
-#     print("=" * 50)
-    
-#     # Save performance metrics to file
-#     with open('results/performance_comparison.txt', 'w') as f:
-#         f.write("Performance Comparison:\n")
-#         f.write("=" * 50 + "\n")
-#         f.write(f"{'Method':<10} {'u-velocity L2':<15} {'v-velocity L2':<15} {'Pressure L2':<15}\n")
-#         f.write("-" * 50 + "\n")
-#         f.write(f"{'PINN':<10} {u_rel_l2_pinn:<15.6f} {v_rel_l2_pinn:<15.6f} {p_rel_l2_pinn:<15.6f}\n")
-#         f.write(f"{'WENO':<10} {u_rel_l2_weno:<15.6f} {v_rel_l2_weno:<15.6f} {p_rel_l2_weno:<15.6f}\n")
-#         f.write("=" * 50 + "\n")
-    
-#     print("\nComparison completed. Results saved to 'results/' directory.")
-
-# # =============================================
-# # Run the comparison
-# # =============================================
-
-# if __name__ == "__main__":
-#     # Run for Re=100 (standard benchmark)
-#     main(Re=100, nx=65, ny=65)
-    
-#     # Optionally, run for other Reynolds numbers to extend the comparison
-#     # main(Re=400, nx=65, ny=65)
-#     # main(Re=1000, nx=101, ny=101)
-
-# Add these functions to your existing code to compute and compare residuals and BC errors
-
 def compute_pinn_evaluation_metrics(model, nx=101, ny=101, Re=100):
     """
     Compute detailed evaluation metrics for PINN model including residuals and BC errors
@@ -965,13 +797,13 @@ def compute_pinn_evaluation_metrics(model, nx=101, ny=101, Re=100):
     
     # Get full solution for comparison
     model.eval()
-    with torch.no_grad():
-        u_pred, v_pred, p_pred = model.net_uvp(x_tensor, y_tensor)
+    # with torch.no_grad():
+    u_pred, v_pred, p_pred = model.net_uvp(x_tensor, y_tensor)
     
     # Convert back to numpy and reshape
-    u_pred = u_pred.cpu().numpy().reshape(ny, nx)
-    v_pred = v_pred.cpu().numpy().reshape(ny, nx)
-    p_pred = p_pred.cpu().numpy().reshape(ny, nx)
+    u_pred = u_pred.detach().cpu().numpy().reshape(ny, nx)
+    v_pred = v_pred.detach().cpu().numpy().reshape(ny, nx)
+    p_pred = p_pred.detach().cpu().numpy().reshape(ny, nx)
     
     # Center the pressure field (it's defined up to a constant)
     p_pred = p_pred - np.mean(p_pred)
@@ -1101,7 +933,13 @@ def main(Re=100, nx=65, ny=65):
     # PART 1: PINN Solution
     # ======================
     print("\n[1/4] Training PINN model...")
-    model, loss_history = train_pinn(Re=Re, num_epochs=100000)  # You can adjust based on computational resources
+
+    train_time_init = time.time()
+
+    model, loss_history = train_pinn(Re=Re, num_epochs=5000)  # You can adjust based on computational resources
+
+    train_time = time.time() - train_time_init
+    print(f"Training time for PINN: {train_time:.2f} seconds")
     
     # Plot loss history
     plt.figure(figsize=(10, 6))
@@ -1113,7 +951,7 @@ def main(Re=100, nx=65, ny=65):
     plt.title('PINN Training Loss History')
     plt.legend()
     plt.grid(True)
-    plt.savefig('results/pinn_loss_history.png', dpi=300, bbox_inches='tight')
+    plt.savefig('results_ns/pinn_loss_history.png', dpi=300, bbox_inches='tight')
     
     print("\n[2/4] Evaluating PINN model...")
     pinn_metrics = compute_pinn_evaluation_metrics(model, nx=nx, ny=ny, Re=Re)
@@ -1124,8 +962,14 @@ def main(Re=100, nx=65, ny=65):
     # PART 2: WENO Solution
     # ======================
     print("\n[3/4] Running WENO solver...")
-    weno_solver = WENOSolver(nx=nx, ny=ny, Re=Re, dt=0.001, max_iter=100000, tol=1e-5)
+
+    solve_time_init = time.time()
+
+    weno_solver = WENOSolver(nx=nx, ny=ny, Re=Re, dt=0.001, max_iter=50000, tol=1e-5)
     u_weno, v_weno, p_weno, weno_history = weno_solver.solve()
+
+    solve_time = time.time() - solve_time_init
+    print(f"Solving time for WENO: {solve_time:.2f} seconds")
     
     # Compute WENO residuals
     dx = 1.0 / (nx - 1)
@@ -1139,7 +983,7 @@ def main(Re=100, nx=65, ny=65):
     plt.ylabel('Residual')
     plt.title('WENO Solver Convergence History')
     plt.grid(True)
-    plt.savefig('results/weno_convergence_history.png', dpi=300, bbox_inches='tight')
+    plt.savefig('results_ns/weno_convergence_history.png', dpi=300, bbox_inches='tight')
     
     # ======================
     # PART 3: Exact Solution
@@ -1175,6 +1019,39 @@ def main(Re=100, nx=65, ny=65):
     print(f"PINN Relative L2 Errors: u = {u_rel_l2_pinn:.6f}, v = {v_rel_l2_pinn:.6f}, p = {p_rel_l2_pinn:.6f}")
     print(f"WENO Relative L2 Errors: u = {u_rel_l2_weno:.6f}, v = {v_rel_l2_weno:.6f}, p = {p_rel_l2_weno:.6f}")
     
+
+    # Plot error comparison
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    
+    # PINN errors
+    cax1 = axes[0, 0].contourf(x_grid, y_grid, u_error_pinn, 50, cmap='hot')
+    plt.colorbar(cax1, ax=axes[0, 0], label='Error')
+    axes[0, 0].set_title('PINN u-velocity Error')
+    
+    cax2 = axes[0, 1].contourf(x_grid, y_grid, v_error_pinn, 50, cmap='hot')
+    plt.colorbar(cax2, ax=axes[0, 1], label='Error')
+    axes[0, 1].set_title('PINN v-velocity Error')
+    
+    cax3 = axes[0, 2].contourf(x_grid, y_grid, p_error_pinn, 50, cmap='hot')
+    plt.colorbar(cax3, ax=axes[0, 2], label='Error')
+    axes[0, 2].set_title('PINN Pressure Error')
+    
+    # WENO errors
+    cax4 = axes[1, 0].contourf(x_grid, y_grid, u_error_weno, 50, cmap='hot')
+    plt.colorbar(cax4, ax=axes[1, 0], label='Error')
+    axes[1, 0].set_title('WENO u-velocity Error')
+    
+    cax5 = axes[1, 1].contourf(x_grid, y_grid, v_error_weno, 50, cmap='hot')
+    plt.colorbar(cax5, ax=axes[1, 1], label='Error')
+    axes[1, 1].set_title('WENO v-velocity Error')
+    
+    cax6 = axes[1, 2].contourf(x_grid, y_grid, p_error_weno, 50, cmap='hot')
+    plt.colorbar(cax6, ax=axes[1, 2], label='Error')
+    axes[1, 2].set_title('WENO Pressure Error')
+    
+    plt.tight_layout()
+    plt.savefig('results_ns/error_comparison.png', dpi=300, bbox_inches='tight')
+
     # =====================================
     # PART 5: Residual and BC Error Comparison (New)
     # =====================================
@@ -1238,7 +1115,7 @@ def main(Re=100, nx=65, ny=65):
     ax.set_yscale('log')
     
     fig.tight_layout()
-    plt.savefig('results/residual_comparison.png', dpi=300, bbox_inches='tight')
+    plt.savefig('results_ns/residual_comparison.png', dpi=300, bbox_inches='tight')
     
     # Bar plots for BC errors
     labels = ['Bottom Wall', 'Top Wall (Lid)', 'Left Wall', 'Right Wall', 'Total']
@@ -1268,10 +1145,10 @@ def main(Re=100, nx=65, ny=65):
     ax.set_yscale('log')
     
     fig.tight_layout()
-    plt.savefig('results/bc_error_comparison.png', dpi=300, bbox_inches='tight')
+    plt.savefig('results_ns/bc_error_comparison.png', dpi=300, bbox_inches='tight')
     
     # Save performance metrics to file with residual and BC comparison
-    with open('results/comprehensive_comparison.txt', 'w') as f:
+    with open('results_ns/comprehensive_comparison.txt', 'w') as f:
         f.write("Performance Comparison:\n")
         f.write("=" * 50 + "\n")
         f.write(f"{'Method':<10} {'u-velocity L2':<15} {'v-velocity L2':<15} {'Pressure L2':<15}\n")
@@ -1309,8 +1186,36 @@ def main(Re=100, nx=65, ny=65):
               f"{weno_metrics['bc_errors']['right']:<15.6e} "
               f"{weno_metrics['bc_errors']['total']:<15.6e}\n")
         f.write("=" * 80 + "\n")
+
+        
     
-    print("\nComprehensive comparison completed. Results saved to 'results/' directory.")
+    print("\nComprehensive comparison completed. results saved to 'results_ns/' directory.")
+    print(f"\nTraining time for PINN: {train_time:.2f} seconds")
+    print(f"Solving time for WENO: {solve_time:.2f} seconds")
+
+    # Measure inference time for PINN
+    print("\nMeasuring inference time for PINN...")
+    inference_time_pinn_start = time.time()
+    pinn_metrics = compute_pinn_evaluation_metrics(model, nx=nx, ny=ny, Re=Re)
+    inference_time_pinn = time.time() - inference_time_pinn_start
+    print(f"Inference time for PINN: {inference_time_pinn:.6f} seconds")
+    
+    # Measure inference time for WENO
+    print("\nMeasuring inference time for WENO...")
+    inference_time_weno_start = time.time()
+    u_weno, v_weno, p_weno, _ = weno_solver.solve()
+    inference_time_weno = time.time() - inference_time_weno_start
+    print(f"Inference time for WENO: {inference_time_weno:.6f} seconds")
+    
+    # Save inference times to file
+    with open('results_ns/inference_times.txt', 'w') as f:
+        f.write("Inference Times:\n")
+        f.write("=" * 30 + "\n")
+        f.write(f"PINN Inference Time: {inference_time_pinn:.6f} seconds\n")
+        f.write(f"WENO Inference Time: {inference_time_weno:.6f} seconds\n")
+        f.write("=" * 30 + "\n")
+    
+    print("\nInference times saved to 'results_ns/inference_times.txt'")
 
 # Run the modified comparison if this script is executed directly
 if __name__ == "__main__":

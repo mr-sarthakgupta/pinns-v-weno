@@ -1,969 +1,713 @@
-# import numpy as np
-# import torch
-# import torch.nn as nn
-# import torch.optim as optim
-# import matplotlib.pyplot as plt
-# from scipy.interpolate import interp1d
-# from tqdm import tqdm
-
-# # Set seeds for reproducibility
-# np.random.seed(1234)
-# torch.manual_seed(1234)
-
-# # Enable GPU if available
-# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-# print(f"Using device: {device}")
-
-# # Parameters for Buckley-Leverett equation
-# class BuckleyLeverettParams:
-#     def __init__(self, M=2.0):
-#         self.M = M  # Mobility ratio (oil/water)
-    
-#     def flux_function(self, s):
-#         """Fractional flow function f(s)"""
-#         return s**2 / (s**2 + self.M * (1 - s)**2)
-    
-#     def flux_derivative(self, s):
-#         """Derivative of fractional flow function f'(s)"""
-#         num = 2 * s * (s**2 + self.M * (1 - s)**2) - s**2 * (2*s - 2*self.M*(1-s))
-#         denom = (s**2 + self.M * (1 - s)**2)**2
-#         return num / denom
-
-# # Exact solution of Buckley-Leverett equation
-# def exact_solution(x, t, params, s_l=0.0, s_r=1.0):
-#     """
-#     Compute the exact solution for the Riemann problem of Buckley-Leverett equation
-#     using the method of characteristics and shock conditions
-#     """
-#     if t <= 0:
-#         return np.where(x < 0, s_l, s_r)
-    
-#     # Find the shock location using equal-area rule
-#     s_values = np.linspace(s_l + 1e-6, s_r - 1e-6, 1000)
-#     f_values = np.array([params.flux_function(s) for s in s_values])
-#     fp_values = np.array([params.flux_derivative(s) for s in s_values])
-    
-#     # Find s* where the characteristic speed equals the shock speed
-#     def find_s_star():
-#         for i in range(len(s_values)-1):
-#             s1, s2 = s_values[i], s_values[i+1]
-#             f1, f2 = f_values[i], f_values[i+1]
-            
-#             # Check if flux is concave at this point
-#             if fp_values[i] < fp_values[i+1]:
-#                 # Compute shock speed
-#                 shock_speed = (f2 - f1) / (s2 - s1)
-                
-#                 # If characteristic speed at s1 > shock speed > characteristic speed at s2
-#                 # This is our s*
-#                 if fp_values[i] > shock_speed > fp_values[i+1]:
-#                     return s1, shock_speed
-#         return None, None
-    
-#     s_star, shock_speed = find_s_star()
-    
-#     if s_star is None:
-#         # Fall back to simpler solution: pure rarefaction wave
-#         s_star = s_r
-#         shock_speed = params.flux_derivative(s_r)
-    
-#     # Compute solution
-#     s_out = np.zeros_like(x, dtype=float)
-    
-#     # Behind the shock
-#     mask_left = x <= shock_speed * t
-#     s_out[mask_left] = s_l
-    
-#     # Rarefaction wave
-#     wave_region = (x > 0) & (x <= params.flux_derivative(s_star) * t)
-    
-#     # Compute s values in rarefaction wave by inverting the characteristic relation
-#     def invert_characteristic(x_over_t):
-#         """Find s such that f'(s) = x/t"""
-#         diff = np.abs(fp_values - x_over_t)
-#         idx = np.argmin(diff)
-#         return s_values[idx]
-    
-#     for i in range(len(x)):
-#         if wave_region[i]:
-#             x_over_t = x[i] / t
-#             s_out[i] = invert_characteristic(x_over_t)
-    
-#     # After the shock
-#     mask_right = x > shock_speed * t
-#     s_out[mask_right] = s_r
-    
-#     return s_out
-
-# # ==================== PINN Implementation ====================
-# class PINN(nn.Module):
-#     def __init__(self, hidden_layers=4, neurons=20):
-#         super(PINN, self).__init__()
-        
-#         # Neural network architecture
-#         layers = []
-#         layers.append(nn.Linear(2, neurons))  # Input layer (x, t)
-#         layers.append(nn.Tanh())
-        
-#         for _ in range(hidden_layers):
-#             layers.append(nn.Linear(neurons, neurons))
-#             layers.append(nn.Tanh())
-        
-#         layers.append(nn.Linear(neurons, 1))  # Output layer (s)
-#         layers.append(nn.Sigmoid())  # Ensure output is between 0 and 1
-        
-#         self.net = nn.Sequential(*layers)
-    
-#     def forward(self, x, t):
-#         inputs = torch.cat([x, t], dim=1)
-#         return self.net(inputs)
-
-# def train_pinn(x_domain, t_final, params, n_points=1000, n_epochs=100000, s_l=0.0, s_r=1.0):
-#     """Train a PINN to solve the Buckley-Leverett equation"""
-#     model = PINN().to(device)
-#     optimizer = optim.Adam(model.parameters(), lr=0.001)
-#     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=500, factor=0.5, verbose=True)
-    
-#     # Generate collocation points for PDE residual
-#     x_collocation = torch.linspace(x_domain[0], x_domain[1], n_points, device=device).view(-1, 1)
-#     t_collocation = torch.linspace(0, t_final, n_points, device=device).view(-1, 1)
-    
-#     X, T = torch.meshgrid(x_collocation.view(-1), t_collocation.view(-1), indexing='ij')
-#     x_pde = X.reshape(-1, 1)
-#     t_pde = T.reshape(-1, 1)
-    
-#     # Generate points for initial condition
-#     x_ic = torch.linspace(x_domain[0], x_domain[1], n_points, device=device).view(-1, 1)
-#     t_ic = torch.zeros_like(x_ic, device=device)
-#     s_ic = torch.zeros_like(x_ic, device=device)
-#     s_ic[x_ic <= 0] = s_l
-#     s_ic[x_ic > 0] = s_r
-    
-#     # Generate points for boundary conditions
-#     t_bc = torch.linspace(0, t_final, n_points, device=device).view(-1, 1)
-#     x_bc_left = torch.full_like(t_bc, x_domain[0], device=device)
-#     x_bc_right = torch.full_like(t_bc, x_domain[1], device=device)
-#     s_bc_left = torch.full_like(t_bc, s_l, device=device)
-#     s_bc_right = torch.full_like(t_bc, s_r, device=device)
-    
-#     # Training loop
-#     pbar = tqdm(range(n_epochs))
-#     losses = []
-    
-#     def flux_torch(s):
-#         """PyTorch version of flux function"""
-#         return s**2 / (s**2 + params.M * (1 - s)**2)
-    
-#     for epoch in pbar:
-#         optimizer.zero_grad()
-        
-#         # Compute PDE residual
-#         x_pde.requires_grad = True
-#         t_pde.requires_grad = True
-        
-#         # Forward pass
-#         s_pred = model(x_pde, t_pde)
-        
-#         # Compute derivatives
-#         s_t = torch.autograd.grad(
-#             s_pred, t_pde, 
-#             grad_outputs=torch.ones_like(s_pred), 
-#             create_graph=True
-#         )[0]
-        
-#         s_x = torch.autograd.grad(
-#             s_pred, x_pde, 
-#             grad_outputs=torch.ones_like(s_pred), 
-#             create_graph=True
-#         )[0]
-        
-#         # Buckley-Leverett PDE: s_t + f(s)_x = 0
-#         # Computing f(s)_x = f'(s) * s_x
-#         f_pred = flux_torch(s_pred)
-#         f_x = torch.autograd.grad(
-#             f_pred, x_pde, 
-#             grad_outputs=torch.ones_like(f_pred), 
-#             create_graph=True
-#         )[0]
-        
-#         residual = s_t + f_x
-#         loss_pde = torch.mean(residual**2)
-        
-#         # Initial condition loss
-#         s_pred_ic = model(x_ic, t_ic)
-#         loss_ic = torch.mean((s_pred_ic - s_ic)**2)
-        
-#         # Boundary condition loss
-#         s_pred_bc_left = model(x_bc_left, t_bc)
-#         s_pred_bc_right = model(x_bc_right, t_bc)
-#         loss_bc = torch.mean((s_pred_bc_left - s_bc_left)**2) + torch.mean((s_pred_bc_right - s_bc_right)**2)
-        
-#         # Total loss
-#         loss = loss_pde + 10.0 * loss_ic + 10.0 * loss_bc
-#         losses.append(loss.item())
-        
-#         # Backpropagation
-#         loss.backward()
-#         optimizer.step()
-#         scheduler.step(loss)
-        
-#         # Update progress bar
-#         if epoch % 100 == 0:
-#             pbar.set_description(f"Loss: {loss.item():.6f}")
-    
-#     plt.figure(figsize=(10, 4))
-#     plt.plot(losses)
-#     plt.yscale('log')
-#     plt.xlabel('Epochs')
-#     plt.ylabel('Loss')
-#     plt.title('PINN Training Loss')
-#     plt.grid(True)
-#     plt.tight_layout()
-#     plt.savefig('pinn_training_loss.png')
-    
-#     return model
-
-# # ==================== WENO Implementation ====================
-# def weno5_reconstruction(v_minus2, v_minus1, v, v_plus1, v_plus2):
-#     """Fifth-order WENO reconstruction for flux computation"""
-#     epsilon = 1e-6
-    
-#     # Compute smoothness indicators
-#     beta0 = 13/12 * (v_minus2 - 2*v_minus1 + v)**2 + 1/4 * (v_minus2 - 4*v_minus1 + 3*v)**2
-#     beta1 = 13/12 * (v_minus1 - 2*v + v_plus1)**2 + 1/4 * (v_minus1 - v_plus1)**2
-#     beta2 = 13/12 * (v - 2*v_plus1 + v_plus2)**2 + 1/4 * (3*v - 4*v_plus1 + v_plus2)**2
-    
-#     # Compute nonlinear weights
-#     d0 = 1/10
-#     d1 = 6/10
-#     d2 = 3/10
-    
-#     alpha0 = d0 / (epsilon + beta0)**2
-#     alpha1 = d1 / (epsilon + beta1)**2
-#     alpha2 = d2 / (epsilon + beta2)**2
-    
-#     omega0 = alpha0 / (alpha0 + alpha1 + alpha2)
-#     omega1 = alpha1 / (alpha0 + alpha1 + alpha2)
-#     omega2 = alpha2 / (alpha0 + alpha1 + alpha2)
-    
-#     # Candidate stencils
-#     p0 = 1/3 * v_minus2 - 7/6 * v_minus1 + 11/6 * v
-#     p1 = -1/6 * v_minus1 + 5/6 * v + 1/3 * v_plus1
-#     p2 = 1/3 * v + 5/6 * v_plus1 - 1/6 * v_plus2
-    
-#     # Final reconstruction
-#     return omega0 * p0 + omega1 * p1 + omega2 * p2
-
-# def solve_weno(x_domain, t_final, params, nx=400, nt=800, s_l=0.0, s_r=1.0):
-#     """Solve the Buckley-Leverett equation using WENO scheme"""
-#     # Set up grid
-#     dx = (x_domain[1] - x_domain[0]) / nx
-#     dt = t_final / nt
-    
-#     # Check CFL condition
-#     max_slope = params.flux_derivative(0.5)  # Approximate maximum slope
-#     cfl = max_slope * dt / dx
-#     print(f"CFL number: {cfl:.4f} (should be < 1)")
-    
-#     if cfl >= 1.0:
-#         nt = int(nt * 1.2)  # Increase time steps if CFL condition not satisfied
-#         dt = t_final / nt
-#         print(f"Adjusted time steps to {nt}, new dt = {dt}, new CFL = {max_slope * dt / dx:.4f}")
-    
-#     # Initialize solution array
-#     x = np.linspace(x_domain[0], x_domain[1], nx+1)
-#     s = np.zeros_like(x)
-#     s[x <= 0] = s_l
-#     s[x > 0] = s_r
-    
-#     # Use ghost cells for boundary conditions
-#     def apply_boundary(s):
-#         s_with_ghost = np.zeros(len(s) + 4)
-#         s_with_ghost[2:-2] = s
-#         s_with_ghost[0:2] = s_l  # Left ghost cells
-#         s_with_ghost[-2:] = s_r  # Right ghost cells
-#         return s_with_ghost
-    
-#     # Time stepping loop with progress bar
-#     pbar = tqdm(total=nt)
-#     convergence_history = []
-    
-#     for n in range(nt):
-#         s_old = s.copy()
-        
-#         # Apply boundary conditions
-#         s_bc = apply_boundary(s)
-        
-#         # Compute numerical fluxes using WENO reconstruction
-#         flux = np.zeros(len(s) + 1)
-        
-#         for j in range(len(flux) - 1):
-#             idx = j + 2  # Offset for ghost cells
-            
-#             # WENO reconstruction for left and right states
-#             s_minus = weno5_reconstruction(
-#                 s_bc[idx-3], s_bc[idx-2], s_bc[idx-1], s_bc[idx], s_bc[idx+1]
-#             )
-#             s_plus = weno5_reconstruction(
-#                 s_bc[idx+2], s_bc[idx+1], s_bc[idx], s_bc[idx-1], s_bc[idx-2]
-#             )
-            
-#             # Compute numerical flux (Lax-Friedrichs flux)
-#             f_minus = params.flux_function(s_minus)
-#             f_plus = params.flux_function(s_plus)
-#             alpha = max(abs(params.flux_derivative(s_minus)), abs(params.flux_derivative(s_plus)))
-            
-#             flux[j] = 0.5 * (f_minus + f_plus - alpha * (s_plus - s_minus))
-        
-#         # Update solution using conservative form
-#         for j in range(len(s)):
-#             s[j] = s[j] - dt/dx * (flux[j+1] - flux[j])
-        
-#         # Check convergence
-#         change = np.max(np.abs(s - s_old))
-#         convergence_history.append(change)
-#         pbar.set_description(f"Change: {change:.6f}")
-#         pbar.update(1)
-    
-#     pbar.close()
-    
-#     # Plot convergence history
-#     plt.figure(figsize=(10, 4))
-#     plt.plot(convergence_history)
-#     plt.yscale('log')
-#     plt.xlabel('Time Steps')
-#     plt.ylabel('Max Change')
-#     plt.title('WENO Convergence History')
-#     plt.grid(True)
-#     plt.tight_layout()
-#     plt.savefig('weno_convergence.png')
-    
-#     return x, s
-
-# # ==================== Main Execution ====================
-# def main():
-#     # Set problem parameters
-#     x_domain = [-2.0, 2.0]
-#     t_final = 0.5
-#     params = BuckleyLeverettParams(M=2.0)
-#     s_l = 0.0  # Left boundary condition
-#     s_r = 1.0  # Right boundary condition
-    
-#     # Solve using WENO
-#     print("Solving using WENO scheme...")
-#     x_weno, s_weno = solve_weno(x_domain, t_final, params, nx=400, nt=100000, s_l=s_l, s_r=s_r)
-    
-#     # Compute exact solution
-#     print("Computing exact solution...")
-#     x_exact = np.linspace(x_domain[0], x_domain[1], 1000)
-#     s_exact = exact_solution(x_exact, t_final, params, s_l=s_l, s_r=s_r)
-    
-#     # Train PINN
-#     print("Training PINN model...")
-#     pinn_model = train_pinn(x_domain, t_final, params, n_points=100, n_epochs=100000, s_l=s_l, s_r=s_r)
-    
-#     # Evaluate PINN solution
-#     print("Evaluating PINN solution...")
-#     x_pinn = torch.linspace(x_domain[0], x_domain[1], 500, device=device).view(-1, 1)
-#     t_pinn = torch.full_like(x_pinn, t_final, device=device)
-    
-#     with torch.no_grad():
-#         s_pinn = pinn_model(x_pinn, t_pinn).cpu().numpy()
-    
-#     # Calculate errors
-#     # Interpolate WENO and PINN solutions to the exact solution grid for error calculation
-#     weno_interp = interp1d(x_weno, s_weno, kind='linear', bounds_error=False, fill_value=(s_l, s_r))
-#     s_weno_interp = weno_interp(x_exact)
-    
-#     pinn_interp = interp1d(x_pinn.cpu().numpy().flatten(), s_pinn.flatten(), kind='linear', bounds_error=False, fill_value=(s_l, s_r))
-#     s_pinn_interp = pinn_interp(x_exact)
-    
-#     l2_error_weno = np.sqrt(np.mean((s_weno_interp - s_exact)**2))
-#     l2_error_pinn = np.sqrt(np.mean((s_pinn_interp - s_exact)**2))
-#     l_inf_error_weno = np.max(np.abs(s_weno_interp - s_exact))
-#     l_inf_error_pinn = np.max(np.abs(s_pinn_interp - s_exact))
-    
-#     print(f"WENO L2 Error: {l2_error_weno:.6f}")
-#     print(f"PINN L2 Error: {l2_error_pinn:.6f}")
-#     print(f"WENO L∞ Error: {l_inf_error_weno:.6f}")
-#     print(f"PINN L∞ Error: {l_inf_error_pinn:.6f}")
-    
-#     # Plot results
-#     plt.figure(figsize=(12, 8))
-    
-#     plt.subplot(2, 1, 1)
-#     plt.plot(x_exact, s_exact, 'k-', linewidth=2, label='Exact Solution')
-#     plt.plot(x_weno, s_weno, 'r--', linewidth=1.5, label=f'WENO (L2: {l2_error_weno:.4f})')
-#     plt.plot(x_pinn.cpu().numpy(), s_pinn, 'b-.', linewidth=1.5, label=f'PINN (L2: {l2_error_pinn:.4f})')
-#     plt.xlabel('x')
-#     plt.ylabel('Saturation (s)')
-#     plt.title(f'Buckley-Leverett Equation Solutions at t = {t_final}')
-#     plt.legend()
-#     plt.grid(True)
-    
-#     plt.subplot(2, 1, 2)
-#     plt.plot(x_exact, np.zeros_like(x_exact), 'k-', linewidth=1)  # Zero line
-#     plt.plot(x_exact, s_weno_interp - s_exact, 'r--', linewidth=1.5, label=f'WENO Error (L∞: {l_inf_error_weno:.4f})')
-#     plt.plot(x_exact, s_pinn_interp - s_exact, 'b-.', linewidth=1.5, label=f'PINN Error (L∞: {l_inf_error_pinn:.4f})')
-#     plt.xlabel('x')
-#     plt.ylabel('Error (s - s_exact)')
-#     plt.title('Error Analysis')
-#     plt.legend()
-#     plt.grid(True)
-    
-#     plt.tight_layout()
-#     plt.savefig('buckley_leverett_comparison.png')
-#     plt.show()
-
-# if __name__ == "__main__":
-#     main()
-
 import numpy as np
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import matplotlib.pyplot as plt
-from scipy.interpolate import interp1d
-from tqdm import tqdm
+from torch.autograd import grad
+import time
+import os
+from matplotlib import cm
 
-# Set seeds for reproducibility
+# Set random seeds for reproducibility
 np.random.seed(1234)
 torch.manual_seed(1234)
 
-# Enable GPU if available
+# Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
-# Parameters for Buckley-Leverett equation
-class BuckleyLeverettParams:
-    def __init__(self, M=2.0):
-        self.M = M  # Mobility ratio (oil/water)
-    
-    def flux_function(self, s):
-        """Fractional flow function f(s)"""
-        return s**2 / (s**2 + self.M * (1 - s)**2)
-    
-    def flux_derivative(self, s):
-        """Derivative of fractional flow function f'(s)"""
-        num = 2 * s * (s**2 + self.M * (1 - s)**2) - s**2 * (2*s - 2*self.M*(1-s))
-        denom = (s**2 + self.M * (1 - s)**2)**2
-        return num / denom
+# Create directory for saving results_bl
+os.makedirs('results_bl', exist_ok=True)
 
-# Exact solution of Buckley-Leverett equation
-def exact_solution(x, t, params, s_l=0.0, s_r=1.0):
+
+# =============================================
+# Define the exact solution for Buckley-Leverett
+# =============================================
+
+def fractional_flow(s, M=2.0):
     """
-    Compute the exact solution for the Riemann problem of Buckley-Leverett equation
-    using the method of characteristics and shock conditions
+    Fractional flow function for Buckley-Leverett equation
+    
+    Args:
+        s: Water saturation
+        M: Mobility ratio (oil/water viscosity ratio)
+    
+    Returns:
+        f: Fractional flow of water
     """
-    if t <= 0:
-        return np.where(x < 0, s_l, s_r)
+    return s**2 / (s**2 + M * (1-s)**2)
+
+def df_ds(s, M=2.0):
+    """
+    Derivative of fractional flow function
+    """
+    numerator = 2 * s * M * (1-s)**2
+    denominator = (s**2 + M * (1-s)**2)**2
+    return numerator / denominator
+
+def exact_solution(x, t, M=2.0, s_l=1.0, s_r=0.0):
+    """
+    Exact solution for Buckley-Leverett equation with Riemann initial data
     
-    # Find the shock location using equal-area rule
-    s_values = np.linspace(s_l + 1e-6, s_r - 1e-6, 1000)
-    f_values = np.array([params.flux_function(s) for s in s_values])
-    fp_values = np.array([params.flux_derivative(s) for s in s_values])
+    Args:
+        x: Spatial coordinates
+        t: Time
+        M: Mobility ratio
+        s_l: Left saturation state
+        s_r: Right saturation state
     
-    # Find s* where the characteristic speed equals the shock speed
-    def find_s_star():
-        for i in range(len(s_values)-1):
-            s1, s2 = s_values[i], s_values[i+1]
-            f1, f2 = f_values[i], f_values[i+1]
-            
-            # Check if flux is concave at this point
-            if fp_values[i] < fp_values[i+1]:
-                # Compute shock speed
-                shock_speed = (f2 - f1) / (s2 - s1)
-                
-                # If characteristic speed at s1 > shock speed > characteristic speed at s2
-                # This is our s*
-                if fp_values[i] > shock_speed > fp_values[i+1]:
-                    return s1, shock_speed
-        return None, None
+    Returns:
+        s: Water saturation
+    """
+    # Initialize saturation
+    s = np.zeros_like(x)
     
-    s_star, shock_speed = find_s_star()
-    
-    if s_star is None:
-        # Fall back to simpler solution: pure rarefaction wave
-        s_star = s_r
-        shock_speed = params.flux_derivative(s_r)
-    
-    # Compute solution
-    s_out = np.zeros_like(x, dtype=float)
-    
-    # Behind the shock
-    mask_left = x <= shock_speed * t
-    s_out[mask_left] = s_l
+    # Shock location
+    s_shock = 0.5  # Approximate for M=2
+    f_shock = fractional_flow(s_shock, M)
+    x_shock = t * df_ds(s_shock, M)
     
     # Rarefaction wave
-    wave_region = (x > 0) & (x <= params.flux_derivative(s_star) * t)
-    
-    # Compute s values in rarefaction wave by inverting the characteristic relation
-    def invert_characteristic(x_over_t):
-        """Find s such that f'(s) = x/t"""
-        diff = np.abs(fp_values - x_over_t)
-        idx = np.argmin(diff)
-        return s_values[idx]
-    
     for i in range(len(x)):
-        if wave_region[i]:
-            x_over_t = x[i] / t
-            s_out[i] = invert_characteristic(x_over_t)
+        if x[i] <= 0:
+            s[i] = s_l
+        elif x[i] >= x_shock:
+            s[i] = s_r
+        else:
+            # Find saturation value by inverting x/t = f'(s)
+            # Using simple search method
+            best_s = s_r
+            min_diff = float('inf')
+            for s_test in np.linspace(s_r, s_shock, 1000):
+                wave_speed = df_ds(s_test, M)
+                if abs(x[i]/t - wave_speed) < min_diff:
+                    min_diff = abs(x[i]/t - wave_speed)
+                    best_s = s_test
+            s[i] = best_s
     
-    # After the shock
-    mask_right = x > shock_speed * t
-    s_out[mask_right] = s_r
-    
-    return s_out
+    return s
 
-# ==================== PINN Implementation ====================
 class PINN(nn.Module):
-    def __init__(self, hidden_layers=4, neurons=20):
+    def __init__(self, num_hidden_layers=6, num_neurons=50, M=2.0):
         super(PINN, self).__init__()
         
-        # Neural network architecture
-        layers = []
-        layers.append(nn.Linear(2, neurons))  # Input layer (x, t)
-        layers.append(nn.Tanh())
+        self.M = M  # Mobility ratio
         
-        for _ in range(hidden_layers):
-            layers.append(nn.Linear(neurons, neurons))
-            layers.append(nn.Tanh())
+        # Input layer (x, t)
+        self.input_layer = nn.Linear(2, num_neurons)
         
-        layers.append(nn.Linear(neurons, 1))  # Output layer (s)
-        layers.append(nn.Sigmoid())  # Ensure output is between 0 and 1
+        # Hidden layers
+        self.hidden_layers = nn.ModuleList()
+        for _ in range(num_hidden_layers):
+            self.hidden_layers.append(nn.Linear(num_neurons, num_neurons))
         
-        self.net = nn.Sequential(*layers)
+        # Output layer (s - saturation)
+        self.output_layer = nn.Linear(num_neurons, 1)
+        
+        # Activation function
+        self.activation = nn.Tanh()
     
-    def forward(self, x, t):
-        inputs = torch.cat([x, t], dim=1)
-        return self.net(inputs)
+    def forward(self, x):
+        """
+        Forward pass of the network
+        
+        Args:
+            x: Input tensor of shape [batch_size, 2] containing coordinates (x, t)
+            
+        Returns:
+            Output tensor of shape [batch_size, 1] containing saturation (s)
+        """
+        x = self.activation(self.input_layer(x))
+        
+        for layer in self.hidden_layers:
+            x = self.activation(layer(x))
+        
+        return self.output_layer(x)
+    
+    def net_s(self, x, t):
+        """
+        Get saturation at coordinates (x, t)
+        
+        Args:
+            x, t: Coordinate tensors
+            
+        Returns:
+            s: Saturation prediction
+        """
+        coords = torch.cat([x, t], dim=1)
+        s = self.forward(coords)
+        return s
+    
+    def fractional_flow(self, s):
+        """
+        Fractional flow function
+        """
+        return s**2 / (s**2 + self.M * (1-s)**2)
+    
+    def df_ds(self, s):
+        """
+        Derivative of fractional flow function
+        """
+        numerator = 2 * s * self.M * (1-s)**2
+        denominator = (s**2 + self.M * (1-s)**2)**2
+        return numerator / denominator
 
-def train_pinn(x_domain, t_final, params, n_points=1000, n_epochs=100000, s_l=0.0, s_r=1.0):
-    """Train a PINN to solve the Buckley-Leverett equation"""
-    model = PINN().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=500, factor=0.5, verbose=True)
+def compute_pinn_residuals(model, x, t):
+    """
+    Compute the Buckley-Leverett equation residuals for the PINN model
     
-    # Generate collocation points for PDE residual
-    x_collocation = torch.linspace(x_domain[0], x_domain[1], n_points, device=device).view(-1, 1)
-    t_collocation = torch.linspace(0, t_final, n_points, device=device).view(-1, 1)
+    Args:
+        model: PINN model
+        x, t: Coordinate tensors
+        
+    Returns:
+        residual: PDE residual
+    """
+    x.requires_grad_(True)
+    t.requires_grad_(True)
     
-    X, T = torch.meshgrid(x_collocation.view(-1), t_collocation.view(-1), indexing='ij')
-    x_pde = X.reshape(-1, 1)
-    t_pde = T.reshape(-1, 1)
+    # Get predictions
+    s = model.net_s(x, t)
     
-    # Generate points for initial condition
-    x_ic = torch.linspace(x_domain[0], x_domain[1], n_points, device=device).view(-1, 1)
-    t_ic = torch.zeros_like(x_ic, device=device)
-    s_ic = torch.zeros_like(x_ic, device=device)
-    s_ic[x_ic <= 0] = s_l
-    s_ic[x_ic > 0] = s_r
+    # Compute derivatives
+    s_x = grad(s.sum(), x, create_graph=True)[0]
+    s_t = grad(s.sum(), t, create_graph=True)[0]
     
-    # Generate points for boundary conditions
-    t_bc = torch.linspace(0, t_final, n_points, device=device).view(-1, 1)
-    x_bc_left = torch.full_like(t_bc, x_domain[0], device=device)
-    x_bc_right = torch.full_like(t_bc, x_domain[1], device=device)
-    s_bc_left = torch.full_like(t_bc, s_l, device=device)
-    s_bc_right = torch.full_like(t_bc, s_r, device=device)
+    # Compute flux derivative
+    f = model.fractional_flow(s)
+    df = model.df_ds(s)
+    
+    # Buckley-Leverett equation: ∂s/∂t + ∂f(s)/∂x = 0
+    # ∂f(s)/∂x = df/ds * ∂s/∂x
+    residual = s_t + df * s_x
+    
+    return residual
+
+def train_pinn(domain_points=10000, boundary_points=1000, M=2.0, num_epochs=20000, 
+               learning_rate=1e-3, display_interval=1000, x_max=1.0, t_max=0.5):
+    """
+    Train the PINN model to solve the Buckley-Leverett equation
+    
+    Args:
+        domain_points: Number of collocation points in the domain
+        boundary_points: Number of points on each boundary
+        M: Mobility ratio
+        num_epochs: Number of training epochs
+        learning_rate: Learning rate for optimizer
+        display_interval: Interval for displaying training progress
+        x_max: Maximum x coordinate
+        t_max: Maximum time
+        
+    Returns:
+        model: Trained model
+        loss_history: History of losses during training
+    """
+    # Create model and move to device
+    model = PINN(num_hidden_layers=8, num_neurons=50, M=M).to(device)
+    
+    # Initialize optimizer
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5000, gamma=0.5)
+    
+    # Generate domain points
+    x_domain = torch.rand(domain_points, 1, device=device) * x_max
+    t_domain = torch.rand(domain_points, 1, device=device) * t_max
+    
+    # Generate initial condition points (t=0)
+    x_initial = torch.rand(boundary_points, 1, device=device) * x_max
+    t_initial = torch.zeros(boundary_points, 1, device=device)
+    
+    # Generate left boundary points (x=0)
+    x_left = torch.zeros(boundary_points, 1, device=device)
+    t_left = torch.rand(boundary_points, 1, device=device) * t_max
+    
+    # Lists to store loss history
+    loss_history = {'total': [], 'pde': [], 'ic': [], 'bc': []}
     
     # Training loop
-    pbar = tqdm(range(n_epochs))
-    losses = []
-    pde_losses = []
-    ic_losses = []
-    bc_losses = []
-    
-    def flux_torch(s):
-        """PyTorch version of flux function"""
-        return s**2 / (s**2 + params.M * (1 - s)**2)
-    
-    for epoch in pbar:
+    start_time = time.time()
+    for epoch in range(num_epochs + 1):
         optimizer.zero_grad()
         
-        # Compute PDE residual
-        x_pde.requires_grad = True
-        t_pde.requires_grad = True
+        # PDE residuals
+        residual = compute_pinn_residuals(model, x_domain, t_domain)
+        pde_loss = torch.mean(residual**2)
         
-        # Forward pass
-        s_pred = model(x_pde, t_pde)
+        # Initial condition: s(x,0) = 0 for x > 0, s(x,0) = 1 for x <= 0
+        s_initial = model.net_s(x_initial, t_initial)
+        ic_target = torch.zeros_like(s_initial)
+        ic_target[x_initial <= 0] = 1.0
+        ic_loss = torch.mean((s_initial - ic_target)**2)
         
-        # Compute derivatives
-        s_t = torch.autograd.grad(
-            s_pred, t_pde, 
-            grad_outputs=torch.ones_like(s_pred), 
-            create_graph=True
-        )[0]
-        
-        s_x = torch.autograd.grad(
-            s_pred, x_pde, 
-            grad_outputs=torch.ones_like(s_pred), 
-            create_graph=True
-        )[0]
-        
-        # Buckley-Leverett PDE: s_t + f(s)_x = 0
-        # Computing f(s)_x = f'(s) * s_x
-        f_pred = flux_torch(s_pred)
-        f_x = torch.autograd.grad(
-            f_pred, x_pde, 
-            grad_outputs=torch.ones_like(f_pred), 
-            create_graph=True
-        )[0]
-        
-        residual = s_t + f_x
-        loss_pde = torch.mean(residual**2)
-        
-        # Initial condition loss
-        s_pred_ic = model(x_ic, t_ic)
-        loss_ic = torch.mean((s_pred_ic - s_ic)**2)
-        
-        # Boundary condition loss
-        s_pred_bc_left = model(x_bc_left, t_bc)
-        s_pred_bc_right = model(x_bc_right, t_bc)
-        loss_bc = torch.mean((s_pred_bc_left - s_bc_left)**2) + torch.mean((s_pred_bc_right - s_bc_right)**2)
+        # Boundary condition: s(0,t) = 1 (constant injection)
+        s_left = model.net_s(x_left, t_left)
+        bc_loss = torch.mean((s_left - 1.0)**2)
         
         # Total loss
-        loss = loss_pde + 10.0 * loss_ic + 10.0 * loss_bc
-        losses.append(loss.item())
-        pde_losses.append(loss_pde.item())
-        ic_losses.append(loss_ic.item())
-        bc_losses.append(loss_bc.item())
+        loss = pde_loss + 10.0 * ic_loss + 10.0 * bc_loss
         
-        # Backpropagation
+        # Backward and optimize
         loss.backward()
         optimizer.step()
-        scheduler.step(loss)
+        scheduler.step()
         
-        # Update progress bar
-        if epoch % 100 == 0:
-            pbar.set_description(f"Loss: {loss.item():.6f}, PDE: {loss_pde.item():.6f}, IC: {loss_ic.item():.6f}, BC: {loss_bc.item():.6f}")
+        # Record losses
+        loss_history['total'].append(loss.item())
+        loss_history['pde'].append(pde_loss.item())
+        loss_history['ic'].append(ic_loss.item())
+        loss_history['bc'].append(bc_loss.item())
+        
+        # Print progress
+        if epoch % display_interval == 0:
+            elapsed = time.time() - start_time
+            print(f"Epoch {epoch}/{num_epochs}, Loss: {loss.item():.6f}, PDE: {pde_loss.item():.6f}, IC: {ic_loss.item():.6f}, BC: {bc_loss.item():.6f}, Time: {elapsed:.2f}s")
+            start_time = time.time()
     
-    # Plot training losses
-    plt.figure(figsize=(15, 5))
-    
-    plt.subplot(1, 2, 1)
-    plt.plot(losses, label='Total Loss')
-    plt.yscale('log')
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.title('PINN Training Total Loss')
-    plt.grid(True)
-    plt.legend()
-    
-    plt.subplot(1, 2, 2)
-    plt.plot(pde_losses, label='PDE Residual')
-    plt.plot(ic_losses, label='Initial Condition')
-    plt.plot(bc_losses, label='Boundary Condition')
-    plt.yscale('log')
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss Components')
-    plt.title('PINN Training Loss Components')
-    plt.grid(True)
-    plt.legend()
-    
-    plt.tight_layout()
-    plt.savefig('pinn_training_loss.png')
-    
-    return model, {"pde_residuals": pde_losses, "ic_losses": ic_losses, "bc_losses": bc_losses}
+    return model, loss_history
 
-# ==================== WENO Implementation ====================
-def weno5_reconstruction(v_minus2, v_minus1, v, v_plus1, v_plus2):
-    """Fifth-order WENO reconstruction for flux computation"""
-    epsilon = 1e-6
-    
-    # Compute smoothness indicators
-    beta0 = 13/12 * (v_minus2 - 2*v_minus1 + v)**2 + 1/4 * (v_minus2 - 4*v_minus1 + 3*v)**2
-    beta1 = 13/12 * (v_minus1 - 2*v + v_plus1)**2 + 1/4 * (v_minus1 - v_plus1)**2
-    beta2 = 13/12 * (v - 2*v_plus1 + v_plus2)**2 + 1/4 * (3*v - 4*v_plus1 + v_plus2)**2
-    
-    # Compute nonlinear weights
-    d0 = 1/10
-    d1 = 6/10
-    d2 = 3/10
-    
-    alpha0 = d0 / (epsilon + beta0)**2
-    alpha1 = d1 / (epsilon + beta1)**2
-    alpha2 = d2 / (epsilon + beta2)**2
-    
-    omega0 = alpha0 / (alpha0 + alpha1 + alpha2)
-    omega1 = alpha1 / (alpha0 + alpha1 + alpha2)
-    omega2 = alpha2 / (alpha0 + alpha1 + alpha2)
-    
-    # Candidate stencils
-    p0 = 1/3 * v_minus2 - 7/6 * v_minus1 + 11/6 * v
-    p1 = -1/6 * v_minus1 + 5/6 * v + 1/3 * v_plus1
-    p2 = 1/3 * v + 5/6 * v_plus1 - 1/6 * v_plus2
-    
-    # Final reconstruction
-    return omega0 * p0 + omega1 * p1 + omega2 * p2
 
-def solve_weno(x_domain, t_final, params, nx=400, nt=800, s_l=0.0, s_r=1.0):
-    """Solve the Buckley-Leverett equation using WENO scheme"""
-    # Set up grid
-    dx = (x_domain[1] - x_domain[0]) / nx
-    dt = t_final / nt
+def evaluate_pinn(model, x_grid, t_grid):
+    """
+    Evaluate the trained PINN model on a grid
     
-    # Check CFL condition
-    max_slope = params.flux_derivative(0.5)  # Approximate maximum slope
-    cfl = max_slope * dt / dx
-    print(f"CFL number: {cfl:.4f} (should be < 1)")
-    
-    if cfl >= 1.0:
-        nt = int(nt * 1.2)  # Increase time steps if CFL condition not satisfied
-        dt = t_final / nt
-        print(f"Adjusted time steps to {nt}, new dt = {dt}, new CFL = {max_slope * dt / dx:.4f}")
-    
-    # Initialize solution array
-    x = np.linspace(x_domain[0], x_domain[1], nx+1)
-    s = np.zeros_like(x)
-    s[x <= 0] = s_l
-    s[x > 0] = s_r
-    
-    # Use ghost cells for boundary conditions
-    def apply_boundary(s):
-        s_with_ghost = np.zeros(len(s) + 4)
-        s_with_ghost[2:-2] = s
-        s_with_ghost[0:2] = s_l  # Left ghost cells
-        s_with_ghost[-2:] = s_r  # Right ghost cells
-        return s_with_ghost
-    
-    # Time stepping loop with progress bar
-    pbar = tqdm(total=nt)
-    convergence_history = []
-    
-    # New: track residuals and boundary condition errors
-    weno_residuals = []
-    weno_bc_errors = []
-    
-    for n in range(nt):
-        s_old = s.copy()
+    Args:
+        model: Trained PINN model
+        x_grid, t_grid: Mesh grid coordinates
         
-        # Apply boundary conditions
-        s_bc = apply_boundary(s)
-        
-        # Compute numerical fluxes using WENO reconstruction
-        flux = np.zeros(len(s) + 1)
-        
-        for j in range(len(flux) - 1):
-            idx = j + 2  # Offset for ghost cells
-            
-            # WENO reconstruction for left and right states
-            s_minus = weno5_reconstruction(
-                s_bc[idx-3], s_bc[idx-2], s_bc[idx-1], s_bc[idx], s_bc[idx+1]
-            )
-            s_plus = weno5_reconstruction(
-                s_bc[idx+2], s_bc[idx+1], s_bc[idx], s_bc[idx-1], s_bc[idx-2]
-            )
-            
-            # Compute numerical flux (Lax-Friedrichs flux)
-            f_minus = params.flux_function(s_minus)
-            f_plus = params.flux_function(s_plus)
-            alpha = max(abs(params.flux_derivative(s_minus)), abs(params.flux_derivative(s_plus)))
-            
-            flux[j] = 0.5 * (f_minus + f_plus - alpha * (s_plus - s_minus))
-        
-        # Update solution using conservative form
-        s_new = s.copy()
-        for j in range(len(s)):
-            s_new[j] = s[j] - dt/dx * (flux[j+1] - flux[j])
-        
-        # Calculate residual: approximation of s_t + f(s)_x
-        residual = np.zeros_like(s)
-        for j in range(1, len(s)-1):
-            # Finite difference approximation of f(s)_x
-            f_j_minus_half = params.flux_function(s[j-1])
-            f_j_plus_half = params.flux_function(s[j+1])
-            f_x = (f_j_plus_half - f_j_minus_half) / (2*dx)
-            
-            # s_t approximation
-            s_t = (s_new[j] - s[j]) / dt
-            
-            # Residual of PDE: s_t + f(s)_x = 0
-            residual[j] = s_t + f_x
-        
-        # Mean squared residual
-        mean_residual = np.mean(residual**2)
-        weno_residuals.append(mean_residual)
-        
-        # Calculate boundary condition error
-        bc_error_left = np.abs(s[0] - s_l)
-        bc_error_right = np.abs(s[-1] - s_r)
-        weno_bc_errors.append(bc_error_left + bc_error_right)
-        
-        # Update solution
-        s = s_new
-        
-        # Check convergence
-        change = np.max(np.abs(s - s_old))
-        convergence_history.append(change)
-        pbar.set_description(f"Change: {change:.6f}, Residual: {mean_residual:.6f}")
-        pbar.update(1)
+    Returns:
+        s_pred: Predicted saturation
+    """
+    # Create mesh grid
+    x_mesh, t_mesh = np.meshgrid(x_grid, t_grid)
     
-    pbar.close()
+    # Convert to PyTorch tensors
+    x_tensor = torch.tensor(x_mesh.flatten()[:, None], dtype=torch.float32, device=device)
+    t_tensor = torch.tensor(t_mesh.flatten()[:, None], dtype=torch.float32, device=device)
     
-    # Plot convergence and residual histories
-    plt.figure(figsize=(15, 5))
-    
-    plt.subplot(1, 2, 1)
-    plt.plot(convergence_history, label='Solution Change')
-    plt.yscale('log')
-    plt.xlabel('Time Steps')
-    plt.ylabel('Max Change')
-    plt.title('WENO Convergence History')
-    plt.grid(True)
-    plt.legend()
-    
-    plt.subplot(1, 2, 2)
-    plt.plot(weno_residuals, label='PDE Residual')
-    plt.plot(weno_bc_errors, label='BC Error')
-    plt.yscale('log')
-    plt.xlabel('Time Steps')
-    plt.ylabel('Error Measures')
-    plt.title('WENO Error Metrics')
-    plt.grid(True)
-    plt.legend()
-    
-    plt.tight_layout()
-    plt.savefig('weno_convergence.png')
-    
-    return x, s, {"residuals": weno_residuals, "bc_errors": weno_bc_errors}
-
-# ==================== Main Execution with Enhanced Analysis ====================
-def main():
-    # Set problem parameters
-    x_domain = [-2.0, 2.0]
-    t_final = 0.5
-    params = BuckleyLeverettParams(M=2.0)
-    s_l = 0.0  # Left boundary condition
-    s_r = 1.0  # Right boundary condition
-    
-    # Solve using WENO
-    print("Solving using WENO scheme...")
-    x_weno, s_weno, weno_metrics = solve_weno(x_domain, t_final, params, nx=4000, nt=10000, s_l=s_l, s_r=s_r)
-    
-    # Compute exact solution
-    print("Computing exact solution...")
-    x_exact = np.linspace(x_domain[0], x_domain[1], 1000)
-    s_exact = exact_solution(x_exact, t_final, params, s_l=s_l, s_r=s_r)
-    
-    # Train PINN
-    print("Training PINN model...")
-    pinn_model, pinn_metrics = train_pinn(x_domain, t_final, params, n_points=100, n_epochs=10000, s_l=s_l, s_r=s_r)
-    
-    # Evaluate PINN solution
-    print("Evaluating PINN solution...")
-    x_pinn = torch.linspace(x_domain[0], x_domain[1], 500, device=device).view(-1, 1)
-    t_pinn = torch.full_like(x_pinn, t_final, device=device)
-    
+    # Evaluate model
+    model.eval()
     with torch.no_grad():
-        s_pinn = pinn_model(x_pinn, t_pinn).cpu().numpy()
+        s_pred = model.net_s(x_tensor, t_tensor)
     
-    # Calculate errors
-    # Interpolate WENO and PINN solutions to the exact solution grid for error calculation
-    weno_interp = interp1d(x_weno, s_weno, kind='linear', bounds_error=False, fill_value=(s_l, s_r))
-    s_weno_interp = weno_interp(x_exact)
+    # Convert back to numpy and reshape
+    s_pred = s_pred.cpu().numpy().reshape(len(t_grid), len(x_grid))
     
-    pinn_interp = interp1d(x_pinn.cpu().numpy().flatten(), s_pinn.flatten(), kind='linear', bounds_error=False, fill_value=(s_l, s_r))
-    s_pinn_interp = pinn_interp(x_exact)
-    
-    l2_error_weno = np.sqrt(np.mean((s_weno_interp - s_exact)**2))
-    l2_error_pinn = np.sqrt(np.mean((s_pinn_interp - s_exact)**2))
-    l_inf_error_weno = np.max(np.abs(s_weno_interp - s_exact))
-    l_inf_error_pinn = np.max(np.abs(s_pinn_interp - s_exact))
-    
-    print(f"WENO L2 Error: {l2_error_weno:.6f}")
-    print(f"PINN L2 Error: {l2_error_pinn:.6f}")
-    print(f"WENO L∞ Error: {l_inf_error_weno:.6f}")
-    print(f"PINN L∞ Error: {l_inf_error_pinn:.6f}")
-    
-    # Plot results
-    plt.figure(figsize=(12, 8))
-    
-    plt.subplot(2, 1, 1)
-    plt.plot(x_exact, s_exact, 'k-', linewidth=2, label='Exact Solution')
-    plt.plot(x_weno, s_weno, 'r--', linewidth=1.5, label=f'WENO (L2: {l2_error_weno:.4f})')
-    plt.plot(x_pinn.cpu().numpy(), s_pinn, 'b-.', linewidth=1.5, label=f'PINN (L2: {l2_error_pinn:.4f})')
-    plt.xlabel('x')
-    plt.ylabel('Saturation (s)')
-    plt.title(f'Buckley-Leverett Equation Solutions at t = {t_final}')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.subplot(2, 1, 2)
-    plt.plot(x_exact, np.zeros_like(x_exact), 'k-', linewidth=1)  # Zero line
-    plt.plot(x_exact, s_weno_interp - s_exact, 'r--', linewidth=1.5, label=f'WENO Error (L∞: {l_inf_error_weno:.4f})')
-    plt.plot(x_exact, s_pinn_interp - s_exact, 'b-.', linewidth=1.5, label=f'PINN Error (L∞: {l_inf_error_pinn:.4f})')
-    plt.xlabel('x')
-    plt.ylabel('Error (s - s_exact)')
-    plt.title('Error Analysis')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.tight_layout()
-    plt.savefig('buckley_leverett_comparison.png')
-    
-    # New: Compare residuals and boundary condition losses
-    # Need to make the arrays same length for comparison
-    min_len = min(len(weno_metrics["residuals"]), len(pinn_metrics["pde_residuals"]))
-    
-    # Normalize for comparison (percentages of max value)
-    weno_residuals_norm = np.array(weno_metrics["residuals"][:min_len]) / max(weno_metrics["residuals"][:min_len])
-    pinn_residuals_norm = np.array(pinn_metrics["pde_residuals"][:min_len]) / max(pinn_metrics["pde_residuals"][:min_len])
-    
-    weno_bc_norm = np.array(weno_metrics["bc_errors"][:min_len]) / max(weno_metrics["bc_errors"][:min_len])
-    pinn_bc_norm = np.array(pinn_metrics["bc_losses"][:min_len]) / max(pinn_metrics["bc_losses"][:min_len])
-    
-    # Create a comparative plot
-    plt.figure(figsize=(15, 10))
-    
-    plt.subplot(2, 2, 1)
-    plt.plot(weno_metrics["residuals"], 'r-', label='WENO')
-    plt.plot(pinn_metrics["pde_residuals"], 'b-', label='PINN')
-    plt.yscale('log')
-    plt.xlabel('Iterations')
-    plt.ylabel('PDE Residual (log scale)')
-    plt.title('Raw PDE Residual Comparison')
-    plt.grid(True)
-    plt.legend()
-    
-    plt.subplot(2, 2, 2)
-    plt.plot(weno_metrics["bc_errors"], 'r-', label='WENO')
-    plt.plot(pinn_metrics["bc_losses"], 'b-', label='PINN')
-    plt.yscale('log')
-    plt.xlabel('Iterations')
-    plt.ylabel('BC Error (log scale)')
-    plt.title('Raw Boundary Condition Error Comparison')
-    plt.grid(True)
-    plt.legend()
-    
-    plt.subplot(2, 2, 3)
-    plt.plot(weno_residuals_norm[:min_len], 'r-', label='WENO')
-    plt.plot(pinn_residuals_norm[:min_len], 'b-', label='PINN')
-    plt.xlabel('Iterations')
-    plt.ylabel('Normalized PDE Residual')
-    plt.title('Normalized PDE Residual Comparison')
-    plt.grid(True)
-    plt.legend()
-    
-    plt.subplot(2, 2, 4)
-    plt.plot(weno_bc_norm[:min_len], 'r-', label='WENO')
-    plt.plot(pinn_bc_norm[:min_len], 'b-', label='PINN')
-    plt.xlabel('Iterations')
-    plt.ylabel('Normalized BC Error')
-    plt.title('Normalized Boundary Condition Error Comparison')
-    plt.grid(True)
-    plt.legend()
-    
-    plt.tight_layout()
-    plt.savefig('residual_comparison.png')
-    plt.show()
-    
-    # Print final metrics for comparison
-    print("\nFinal Metrics Comparison:")
-    print(f"WENO Final PDE Residual: {weno_metrics['residuals'][-1]:.6e}")
-    print(f"PINN Final PDE Residual: {pinn_metrics['pde_residuals'][-1]:.6e}")
-    print(f"WENO Final BC Error: {weno_metrics['bc_errors'][-1]:.6e}")
-    print(f"PINN Final BC Error: {pinn_metrics['bc_losses'][-1]:.6e}")
-    print(f"PINN Final IC Error: {pinn_metrics['ic_losses'][-1]:.6e}")
+    return s_pred
 
+# =============================================
+# WENO Scheme Implementation for Navier-Stokes
+# =============================================
+
+class WENOSolver:
+    def __init__(self, nx=101, nt=101, x_max=1.0, t_max=0.5, M=2.0, cfl=0.4):
+        """
+        Initialize the WENO solver for Buckley-Leverett equation
+        
+        Args:
+            nx: Number of grid points in x direction
+            nt: Number of time steps
+            x_max: Maximum x coordinate
+            t_max: Maximum time
+            M: Mobility ratio
+            cfl: CFL number
+        """
+        self.nx = nx
+        self.nt = nt
+        self.x_max = x_max
+        self.t_max = t_max
+        self.M = M
+        self.cfl = cfl
+        
+        # Grid spacing
+        self.dx = x_max / (nx - 1)
+        
+        # Initialize grid
+        self.x = np.linspace(0, x_max, nx)
+        self.t = np.linspace(0, t_max, nt)
+        self.dt = self.t[1] - self.t[0]
+        
+        # Check CFL condition
+        max_wave_speed = self.df_ds(0.5)  # Approximate maximum wave speed
+        dt_cfl = cfl * self.dx / max_wave_speed
+        if self.dt > dt_cfl:
+            print(f"Warning: Time step {self.dt} is larger than CFL limit {dt_cfl}")
+            self.dt = dt_cfl
+            self.t = np.linspace(0, t_max, int(t_max/self.dt) + 1)
+            self.nt = len(self.t)
+        
+        # Initialize solution
+        self.s = np.zeros((self.nt, self.nx))
+        
+        # Initial condition: s(x,0) = 0 for x > 0, s(x,0) = 1 for x <= 0
+        self.s[0, :] = np.where(self.x <= 0, 1.0, 0.0)
+    
+    def fractional_flow(self, s):
+        """
+        Fractional flow function
+        """
+        return s**2 / (s**2 + self.M * (1-s)**2)
+    
+    def df_ds(self, s):
+        """
+        Derivative of fractional flow function
+        """
+        numerator = 2 * s * self.M * (1-s)**2
+        denominator = (s**2 + self.M * (1-s)**2)**2
+        return numerator / denominator
+    
+    def weno5_reconstruction(self, q):
+        # Shift arrays for stencil
+        qm2 = np.roll(q, 2, axis=1)
+        qm1 = np.roll(q, 1, axis=1)
+        qp1 = np.roll(q, -1, axis=1)
+        qp2 = np.roll(q, -2, axis=1)
+        
+        # Constants
+        epsilon = 1e-6
+        c_1 = 1/10
+        c_2 = 6/10
+        c_3 = 3/10
+        
+        # Smoothness indicators
+        beta1 = 13/12 * (qm2 - 2*qm1 + q)**2 + 1/4 * (qm2 - 4*qm1 + 3*q)**2
+        beta2 = 13/12 * (qm1 - 2*q + qp1)**2 + 1/4 * (qm1 - qp1)**2
+        beta3 = 13/12 * (q - 2*qp1 + qp2)**2 + 1/4 * (3*q - 4*qp1 + qp2)**2
+        
+        # Compute nonlinear weights for q_{i+1/2}^-
+        alpha1 = c_1 / ((epsilon + beta1)**2)
+        alpha2 = c_2 / ((epsilon + beta2)**2)
+        alpha3 = c_3 / ((epsilon + beta3)**2)
+        
+        omega1 = alpha1 / (alpha1 + alpha2 + alpha3)
+        omega2 = alpha2 / (alpha1 + alpha2 + alpha3)
+        omega3 = alpha3 / (alpha1 + alpha2 + alpha3)
+        
+        # Candidate stencils for q_{i+1/2}^-
+        p1 = (2*qm2 - 7*qm1 + 11*q) / 6
+        p2 = (-qm1 + 5*q + 2*qp1) / 6
+        p3 = (2*q + 5*qp1 - qp2) / 6
+        
+        # Reconstruct q_{i+1/2}^-
+        q_minus = omega1 * p1 + omega2 * p2 + omega3 * p3
+        
+        # For q_{i+1/2}^+ we need to shift our reference point to i+1
+        # But instead of shifting all arrays again, we'll redefine the stencils
+        
+        # Smoothness indicators for the "plus" side
+        beta1_plus = 13/12 * (q - 2*qp1 + qp2)**2 + 1/4 * (q - 4*qp1 + 3*qp2)**2
+        beta2_plus = 13/12 * (qm1 - 2*q + qp1)**2 + 1/4 * (qm1 - qp1)**2
+        beta3_plus = 13/12 * (qm2 - 2*qm1 + q)**2 + 1/4 * (3*qm2 - 4*qm1 + q)**2
+        
+        # Compute nonlinear weights for q_{i-1/2}^+
+        alpha1_plus = c_3 / ((epsilon + beta1_plus)**2)
+        alpha2_plus = c_2 / ((epsilon + beta2_plus)**2)
+        alpha3_plus = c_1 / ((epsilon + beta3_plus)**2)
+        
+        omega1_plus = alpha1_plus / (alpha1_plus + alpha2_plus + alpha3_plus)
+        omega2_plus = alpha2_plus / (alpha1_plus + alpha2_plus + alpha3_plus)
+        omega3_plus = alpha3_plus / (alpha1_plus + alpha2_plus + alpha3_plus)
+        
+        # Candidate stencils for q_{i-1/2}^+
+        p1_plus = (2*qp2 - 7*qp1 + 11*q) / 6
+        p2_plus = (-qp1 + 5*q + 2*qm1) / 6
+        p3_plus = (2*q + 5*qm1 - qm2) / 6
+        # Reconstruct q_{i-1/2}^+
+        q_plus = omega1_plus * p1_plus + omega2_plus * p2_plus + omega3_plus * p3_plus
+        # Handle boundaries by zeroing out appropriate cells
+        q_minus[:, 0] = q[:, 0]
+        q_minus[:, -1] = q[:, -1]
+        q_plus[:, 0] = q[:, 0]
+        q_plus[:, -1] = q[:, -1]        
+        return q_minus, q_plus
+    
+    def compute_flux(self, s):
+        """
+        Compute numerical flux using WENO reconstruction
+        
+        Args:
+            s: Saturation array
+            
+        Returns:
+            flux: Numerical flux
+        """
+        # Compute physical flux
+        f = self.fractional_flow(s)
+        
+        # WENO reconstruction
+        f_minus, f_plus = self.weno5_reconstruction(f)
+        
+        # Numerical flux (upwind based on wave speed sign)
+        wave_speed = self.df_ds(s)
+        pos_mask = wave_speed >= 0
+        neg_mask = wave_speed < 0
+        
+        flux = np.zeros_like(f)
+        flux[pos_mask] = f_minus[pos_mask]
+        flux[neg_mask] = f_plus[neg_mask]
+        
+        return flux
+    
+    def solve(self):
+        """
+        Solve the Buckley-Leverett equation using WENO scheme
+        
+        Returns:
+            s: Solution array for all time steps
+        """
+        # Time stepping
+        for n in range(self.nt-1):
+            # Compute flux
+            flux = self.compute_flux(self.s[n, :])
+            
+            # Boundary conditions
+            # Left boundary: s(0,t) = 1 (constant injection)
+            self.s[n, 0] = 1.0
+            
+            # Update solution with conservative form
+            # s_t + f(s)_x = 0
+            for i in range(1, self.nx-1):
+                self.s[n+1, i] = self.s[n, i] - self.dt/self.dx * (flux[i+1] - flux[i-1])/2
+            
+            # Enforce boundary conditions
+            self.s[n+1, 0] = 1.0
+            self.s[n+1, -1] = self.s[n+1, -2]  # Outflow condition
+        
+        return self.s
+
+def compute_pinn_evaluation_metrics(model, nx=101, ny=101, Re=100):
+    """
+    Compute detailed evaluation metrics for PINN model including residuals and BC errors
+    
+    Args:
+        model: Trained PINN model
+        nx, ny: Number of grid points in x and y directions
+        Re: Reynolds number
+        
+    Returns:
+        Dict containing all evaluation metrics
+    """
+    # Create mesh grid
+    x = np.linspace(0, 1, nx)
+    y = np.linspace(0, 1, ny)
+    x_grid, y_grid = np.meshgrid(x, y)
+    
+    # Convert to PyTorch tensors
+    x_tensor = torch.tensor(x_grid.flatten()[:, None], dtype=torch.float32, device=device)
+    y_tensor = torch.tensor(y_grid.flatten()[:, None], dtype=torch.float32, device=device)
+    
+    # Compute residuals
+    continuity, momentum_x, momentum_y = compute_pinn_residuals(model, x_tensor, y_tensor, Re)
+    
+    # Extract boundary points
+    # Bottom boundary (y=0)
+    bottom_indices = [i for i in range(len(y_tensor)) if y_tensor[i].item() < 1e-10]
+    x_bottom = x_tensor[bottom_indices]
+    y_bottom = y_tensor[bottom_indices]
+    
+    # Top boundary (y=1)
+    top_indices = [i for i in range(len(y_tensor)) if abs(y_tensor[i].item() - 1.0) < 1e-10]
+    x_top = x_tensor[top_indices]
+    y_top = y_tensor[top_indices]
+    
+    # Left boundary (x=0)
+    left_indices = [i for i in range(len(x_tensor)) if x_tensor[i].item() < 1e-10]
+    x_left = x_tensor[left_indices]
+    y_left = y_tensor[left_indices]
+    
+    # Right boundary (x=1)
+    right_indices = [i for i in range(len(x_tensor)) if abs(x_tensor[i].item() - 1.0) < 1e-10]
+    x_right = x_tensor[right_indices]
+    y_right = y_tensor[right_indices]
+    
+    # Boundary conditions
+    # Bottom wall: u=v=0
+    u_bottom, v_bottom, _ = model.net_uvp(x_bottom, y_bottom)
+    
+    # Top wall: u=1, v=0 (lid)
+    u_top, v_top, _ = model.net_uvp(x_top, y_top)
+    
+    # Left wall: u=v=0
+    u_left, v_left, _ = model.net_uvp(x_left, y_left)
+    
+    # Right wall: u=v=0
+    u_right, v_right, _ = model.net_uvp(x_right, y_right)
+    
+    # Calculate BC errors
+    bc_error_bottom = torch.mean(u_bottom**2 + v_bottom**2).cpu().item()
+    bc_error_top = torch.mean((u_top - 1.0)**2 + v_top**2).cpu().item()
+    bc_error_left = torch.mean(u_left**2 + v_left**2).cpu().item()
+    bc_error_right = torch.mean(u_right**2 + v_right**2).cpu().item()
+    
+    # Get full solution for comparison
+    model.eval()
+    # with torch.no_grad():
+    u_pred, v_pred, p_pred = model.net_uvp(x_tensor, y_tensor)
+    
+    # Convert back to numpy and reshape
+    u_pred = u_pred.detach().cpu().numpy().reshape(ny, nx)
+    v_pred = v_pred.detach().cpu().numpy().reshape(ny, nx)
+    p_pred = p_pred.detach().cpu().numpy().reshape(ny, nx)
+    
+    # Center the pressure field (it's defined up to a constant)
+    p_pred = p_pred - np.mean(p_pred)
+    
+    # Compute mean squared residuals
+    mean_continuity = torch.mean(continuity**2).cpu().item()
+    mean_momentum_x = torch.mean(momentum_x**2).cpu().item()
+    mean_momentum_y = torch.mean(momentum_y**2).cpu().item()
+    
+    metrics = {
+        'u': u_pred,
+        'v': v_pred,
+        'p': p_pred,
+        'x_grid': x_grid,
+        'y_grid': y_grid,
+        'residuals': {
+            'continuity': mean_continuity,
+            'momentum_x': mean_momentum_x,
+            'momentum_y': mean_momentum_y,
+            'total': mean_continuity + mean_momentum_x + mean_momentum_y
+        },
+        'bc_errors': {
+            'bottom': bc_error_bottom,
+            'top': bc_error_top,
+            'left': bc_error_left,
+            'right': bc_error_right,
+            'total': bc_error_bottom + bc_error_top + bc_error_left + bc_error_right
+        }
+    }
+    
+    return metrics
+
+# Update the main function to include the residual and BC error comparisons
+def main(M=2.0, nx=101, nt=101, x_max=1.0, t_max=0.5):
+    """
+    Main function to run the comparison between PINN and WENO
+    
+    Args:
+        M: Mobility ratio
+        nx: Number of grid points in x direction
+        nt: Number of time steps
+        x_max: Maximum x coordinate
+        t_max: Maximum time
+    """
+    print("=" * 50)
+    print(f"Comparing PINN and WENO for Buckley-Leverett equation with M = {M}")
+    print("=" * 50)
+    
+    # Create grid
+    x_grid = np.linspace(0, x_max, nx)
+    t_grid = np.linspace(0, t_max, nt)
+    
+    # ======================
+    # PART 1: PINN Solution
+    # ======================
+    print("\n[1/4] Training PINN model...")
+    model, loss_history = train_pinn(M=M, num_epochs=100, x_max=x_max, t_max=t_max)
+    
+    # Plot loss history
+    plt.figure(figsize=(10, 6))
+    plt.semilogy(loss_history['total'], label='Total Loss')
+    plt.semilogy(loss_history['pde'], label='PDE Loss')
+    plt.semilogy(loss_history['ic'], label='IC Loss')
+    plt.semilogy(loss_history['bc'], label='BC Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('PINN Training Loss History')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('results_bl/bl_pinn_loss_history.png', dpi=300, bbox_inches='tight')
+    
+    print("\n[2/4] Evaluating PINN model...")
+    s_pinn = evaluate_pinn(model, x_grid, t_grid)
+    
+    # ======================
+    # PART 2: WENO Solution
+    # ======================
+    print("\n[3/4] Running WENO solver...")
+    weno_solver = WENOSolver(nx=nx, nt=nt, x_max=x_max, t_max=t_max, M=M)
+    s_weno = weno_solver.solve()
+    
+    # ======================
+    # PART 3: Exact Solution
+    # ======================
+    print("\n[4/4] Computing exact solution...")
+    s_exact = np.zeros((nt, nx))
+    for i, t in enumerate(t_grid):
+        if t > 0:  # Skip t=0 to avoid division by zero
+            s_exact[i, :] = exact_solution(x_grid, t, M=M)
+        else:
+            s_exact[i, :] = np.where(x_grid <= 0, 1.0, 0.0)
+    
+    # ======================
+    # PART 4: Visualization
+    # ======================
+    # Plot saturation profiles at different times
+    times_to_plot = [0.1, 0.2, 0.3, 0.4]
+    time_indices = [np.abs(t_grid - t).argmin() for t in times_to_plot]
+    
+    plt.figure(figsize=(15, 10))
+    for i, t_idx in enumerate(time_indices):
+        plt.subplot(2, 2, i+1)
+        plt.plot(x_grid, s_exact[t_idx, :], 'k-', linewidth=2, label='Exact')
+        plt.plot(x_grid, s_pinn[t_idx, :], 'r--', linewidth=2, label='PINN')
+        plt.plot(x_grid, s_weno[t_idx, :], 'b-.', linewidth=2, label='WENO')
+        plt.xlabel('x')
+        plt.ylabel('Saturation')
+        plt.title(f'Time t = {t_grid[t_idx]:.2f}')
+        plt.legend()
+        plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('results_bl/bl_saturation_profiles.png', dpi=300, bbox_inches='tight')
+    
+    # Compute errors
+    s_error_pinn = np.abs(s_pinn - s_exact)
+    s_error_weno = np.abs(s_weno - s_exact)
+    
+    # L2 relative error
+    s_rel_l2_pinn = np.sqrt(np.sum(s_error_pinn**2)) / np.sqrt(np.sum(s_exact**2))
+    s_rel_l2_weno = np.sqrt(np.sum(s_error_weno**2)) / np.sqrt(np.sum(s_exact**2))
+    
+    # Print error summary
+    print("\nError Summary:")
+    print(f"PINN Relative L2 Error: s = {s_rel_l2_pinn:.6f}")
+    print(f"WENO Relative L2 Error: s = {s_rel_l2_weno:.6f}")
+    
+    # Plot error comparison
+    plt.figure(figsize=(12, 5))
+    
+    plt.subplot(1, 2, 1)
+    plt.contourf(x_grid, t_grid, s_error_pinn, 50, cmap='hot')
+    plt.colorbar(label='Error')
+    plt.xlabel('x')
+    plt.ylabel('t')
+    plt.title('PINN Error')
+    
+    plt.subplot(1, 2, 2)
+    plt.contourf(x_grid, t_grid, s_error_weno, 50, cmap='hot')
+    plt.colorbar(label='Error')
+    plt.xlabel('x')
+    plt.ylabel('t')
+    plt.title('WENO Error')
+    
+    plt.tight_layout()
+    plt.savefig('results_bl/bl_error_comparison.png', dpi=300, bbox_inches='tight')
+    
+    # Save performance metrics
+    with open('results_bl/bl_performance_comparison.txt', 'w') as f:
+        f.write("Performance Comparison for Buckley-Leverett:\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"{'Method':<10} {'Saturation L2':<15}\n")
+        f.write("-" * 50 + "\n")
+        f.write(f"{'PINN':<10} {s_rel_l2_pinn:<15.6f}\n")
+        f.write(f"{'WENO':<10} {s_rel_l2_weno:<15.6f}\n")
+        f.write("=" * 50 + "\n")
+    
+    print("\nComparison completed. Results saved to 'results_bl/' directory.")
+
+
+# Run the modified comparison if this script is executed directly
 if __name__ == "__main__":
-    main()
+    # Run for Re=100 (standard benchmark)
+    main(M=2.0, nx=101, nt=101, x_max=1.0, t_max=0.5)
